@@ -1,0 +1,258 @@
+//+------------------------------------------------------------------+
+//|                                         Recorder_B3_Pro_V3.mq5   |
+//|                          Versão Corrigida - Gravação Consistente|
+//+------------------------------------------------------------------+
+#property strict
+#property version   "3.0"
+
+// Parâmetros de Entrada Otimizados
+input int      InpMaxTicks     = 5000;      // Gravar a cada X ticks
+input int      InpMaxSeconds   = 60;        // Gravar a cada X segundos
+input bool     InpFilterTradingHours = true; // Filtrar apenas pregão (09:00-18:25)
+input bool     InpShowPanel    = true;      // Mostrar Painel
+
+// Constantes
+#define TRADING_START_HOUR   9
+#define TRADING_START_MIN    0
+#define TRADING_END_HOUR     18
+#define TRADING_END_MIN      25
+
+// Variáveis Globais
+int      db_handle = INVALID_HANDLE;
+int      ticks_buffer = 0;
+datetime last_commit_time;
+long     total_records = 0;
+datetime current_date = 0;
+bool     within_trading_hours = false;
+
+// Último tick gravado para controle de duplicatas
+MqlTick  last_saved_tick;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // Abrir banco de dados
+   string db_filename = _Symbol + "_B3_Ticks.db";
+   db_handle = DatabaseOpen(db_filename, DATABASE_OPEN_READWRITE | DATABASE_OPEN_CREATE | DATABASE_OPEN_COMMON);
+   
+   if(db_handle == INVALID_HANDLE)
+   {
+      Print("❌ Erro ao abrir banco: ", GetLastError());
+      return(INIT_FAILED);
+   }
+   
+   // Otimizações
+   DatabaseExecute(db_handle, "PRAGMA synchronous = NORMAL");
+   DatabaseExecute(db_handle, "PRAGMA journal_mode = WAL");
+   DatabaseExecute(db_handle, "PRAGMA cache_size = 10000");
+   
+   // Criar tabela com índices
+   string create_table = "CREATE TABLE IF NOT EXISTS TICKS("
+                        "SYMBOL TEXT, "
+                        "TIME_MSC INTEGER PRIMARY KEY, "
+                        "LAST REAL, "
+                        "BID REAL, "
+                        "ASK REAL, "
+                        "VOLUME INTEGER);"
+                        "CREATE INDEX IF NOT EXISTS idx_time ON TICKS(TIME_MSC);";
+   
+   if(!DatabaseExecute(db_handle, create_table))
+   {
+      Print("❌ Erro ao criar tabela: ", GetLastError());
+      return(INIT_FAILED);
+   }
+   
+   // Iniciar transação
+   DatabaseExecute(db_handle, "BEGIN IMMEDIATE TRANSACTION");
+   
+   last_commit_time = TimeCurrent();
+   last_saved_tick.time_msc = 0;
+   
+   // Verificar horário atual
+   CheckTradingHours();
+   
+   if(InpShowPanel) CreatePanel();
+   
+   EventSetTimer(1);
+   Print("✅ Recorder iniciado para ", _Symbol);
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Check if within trading hours                                   |
+//+------------------------------------------------------------------+
+bool CheckTradingHours()
+{
+   if(!InpFilterTradingHours) return(true);
+   
+   MqlDateTime dt;
+   TimeCurrent(dt);  // Usar hora do servidor para consistência
+   
+   int current_minutes = dt.hour * 60 + dt.min;
+   int start_minutes = TRADING_START_HOUR * 60 + TRADING_START_MIN;
+   int end_minutes = TRADING_END_HOUR * 60 + TRADING_END_MIN;
+   
+   within_trading_hours = (current_minutes >= start_minutes && current_minutes <= end_minutes);
+   
+   // Atualizar data corrente
+   datetime new_date = StructToTime(dt);
+   if(new_date != current_date)
+   {
+      current_date = new_date;
+      Print("📅 Novo dia de negociação: ", TimeToString(current_date, TIME_DATE));
+   }
+   
+   return(within_trading_hours);
+}
+
+//+------------------------------------------------------------------+
+//| Timer function - Monitoramento                                  |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+   // Verificar horário de negociação
+   bool was_trading = within_trading_hours;
+   CheckTradingHours();
+   
+   // Log de mudança de status
+   if(was_trading != within_trading_hours)
+   {
+      if(within_trading_hours)
+         Print("▶️ Pregão iniciado - gravando dados...");
+      else
+      {
+         Print("⏸️ Pregão encerrado - pausando gravação");
+         // Commit forçado ao final do pregão
+         ForceCommit("Fim do pregão");
+      }
+   }
+   
+   // Commit por tempo
+   if(ticks_buffer > 0 && (TimeCurrent() - last_commit_time) >= InpMaxSeconds)
+   {
+      ForceCommit("Timeout de segundos");
+   }
+   
+   if(InpShowPanel) UpdatePanel();
+}
+
+//+------------------------------------------------------------------+
+//| Tick event - Main recording logic                               |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Verificar se está dentro do horário de negociação
+   if(!CheckTradingHours()) return;
+   
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick)) return;
+   
+   // Critério rigoroso para evitar duplicatas
+   bool is_new_tick = (tick.time_msc != last_saved_tick.time_msc) ||
+                      (MathAbs(tick.last - last_saved_tick.last) > 0.01) ||
+                      (MathAbs(tick.bid - last_saved_tick.bid) > 0.01) ||
+                      (MathAbs(tick.ask - last_saved_tick.ask) > 0.01) ||
+                      (tick.volume_real != last_saved_tick.volume_real);
+   
+   if(!is_new_tick) return;
+   
+   // Preparar query parametrizada (mais segura)
+   string query = StringFormat("INSERT OR IGNORE INTO TICKS VALUES('%s', %lld, %.2f, %.2f, %.2f, %lld)",
+                              _Symbol, 
+                              tick.time_msc,
+                              tick.last,
+                              tick.bid,
+                              tick.ask,
+                              (long)tick.volume_real);
+   
+   if(DatabaseExecute(db_handle, query))
+   {
+      ticks_buffer++;
+      total_records++;
+      last_saved_tick = tick;
+      
+      // Commit por quantidade de ticks
+      if(ticks_buffer >= InpMaxTicks)
+      {
+         ForceCommit("Buffer cheio");
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Commit current transaction and start new one                    |
+//+------------------------------------------------------------------+
+void ForceCommit(string reason = "")
+{
+   if(ticks_buffer == 0) return;
+   
+   if(DatabaseExecute(db_handle, "COMMIT"))
+   {
+      Print(StringFormat("💾 Commit: %d ticks salvos (%s)", ticks_buffer, reason));
+      
+      if(DatabaseExecute(db_handle, "BEGIN IMMEDIATE TRANSACTION"))
+      {
+         ticks_buffer = 0;
+         last_commit_time = TimeCurrent();
+      }
+      else
+      {
+         Print("❌ Erro ao iniciar nova transação");
+      }
+   }
+   else
+   {
+      Print("❌ Erro no commit: ", GetLastError());
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Panel functions                                                  |
+//+------------------------------------------------------------------+
+void CreatePanel()
+{
+   ObjectCreate(0, "Status_Panel", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, "Status_Panel", OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(0, "Status_Panel", OBJPROP_YDISTANCE, 10);
+   ObjectSetInteger(0, "Status_Panel", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, "Status_Panel", OBJPROP_FONTSIZE, 10);
+   ObjectSetInteger(0, "Status_Panel", OBJPROP_COLOR, clrAqua);
+}
+
+void UpdatePanel()
+{
+   string status = within_trading_hours ? "▶️ GRAVANDO" : "⏸️ PAUSADO";
+   string info = StringFormat("%s | Buffer: %d/%d | Total: %lld | Último: %ds", 
+                              status,
+                              ticks_buffer, 
+                              InpMaxTicks, 
+                              total_records,
+                              (int)(TimeCurrent() - last_commit_time));
+   
+   ObjectSetString(0, "Status_Panel", OBJPROP_TEXT, info);
+}
+
+//+------------------------------------------------------------------+
+//| Deinitialization function                                       |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   EventKillTimer();
+   
+   if(db_handle != INVALID_HANDLE)
+   {
+      // Commit final antes de fechar
+      if(ticks_buffer > 0)
+      {
+         ForceCommit("Desconexão");
+      }
+      
+      DatabaseExecute(db_handle, "COMMIT");
+      DatabaseClose(db_handle);
+      Print("✅ Banco fechado. Total de registros: ", total_records);
+   }
+   
+   ObjectsDeleteAll(0, "Status_Panel");
+}
